@@ -3,30 +3,36 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.core.paginator import Paginator
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
+from drf_yasg.utils import swagger_auto_schema
 
 from .models import Article
 from .serializers import *
+from .services import ArticleService
+from article_api.swagger_documentation import *
 
 class ArticleCreateView(APIView):
+    @swagger_auto_schema(
+        operation_description="Create a new article",
+        request_body=article_create_schema,
+        responses={201: ArticleDetailSerializer, 400: 'Bad Request'},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def post(self, request):
         serializer = ArticleCreateSerializer(data=request.data)
         if serializer.is_valid():
-            # In real implementation, check user role from request
-            is_staff = request.data.get('is_staff', False)
+            # Get business_id from authenticated user or request
+            business_id = getattr(request.user, 'business_id', request.GET.get('business_id', 'default_business'))
+            
+            # Check if user is staff (from token claims)
+            is_staff = getattr(request.user, 'usertype', None) == 'business'
             
             article_data = serializer.validated_data.copy()
+            article_data['business_id'] = business_id
             
-            # Auto-set status for students
-            if not is_staff and 'status' not in article_data:
-                article_data['status'] = 'pending_review'
-                article_data['submitted_at'] = timezone.now()
-            
-            # Validate staff can set published status
-            if is_staff and article_data.get('status') == 'published':
-                article_data['published_at'] = timezone.now()
-            
-            article = Article.objects.create(**article_data)
+            article = ArticleService.create_article(
+                article_data, 
+                is_staff=is_staff
+            )
             
             response_serializer = ArticleDetailSerializer(article)
             return Response(response_serializer.data, status=status.HTTP_201_CREATED)
@@ -34,42 +40,57 @@ class ArticleCreateView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class ArticleUpdateView(APIView):
+    @swagger_auto_schema(
+        operation_description="Update an existing article",
+        request_body=article_update_schema,
+        responses={200: ArticleDetailSerializer, 400: 'Bad Request', 404: 'Not Found'},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def put(self, request, article_id):
         article = get_object_or_404(Article, id=article_id)
         
         serializer = ArticleUpdateSerializer(data=request.data)
         if serializer.is_valid():
-            # In real implementation, check user role from request
-            is_staff = request.data.get('is_staff', False)
+            # Check if user is staff
+            is_staff = getattr(request.user, 'usertype', None) == 'business'
             
-            data = serializer.validated_data.copy()
+            updated_article = ArticleService.update_article(
+                article_id, 
+                serializer.validated_data, 
+                is_staff=is_staff
+            )
             
-            # Handle status transitions
-            if 'status' in data:
-                new_status = data['status']
-                if new_status == 'pending_review' and article.status != 'pending_review':
-                    data['submitted_at'] = timezone.now()
-                
-                if new_status == 'published' and is_staff:
-                    data['published_at'] = timezone.now()
+            if updated_article:
+                response_serializer = ArticleDetailSerializer(updated_article)
+                return Response(response_serializer.data)
             
-            # Update article fields
-            for field, value in data.items():
-                setattr(article, field, value)
-            
-            article.save()
-            response_serializer = ArticleDetailSerializer(article)
-            return Response(response_serializer.data)
-        
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class ArticleDetailView(APIView):
+    @swagger_auto_schema(
+        operation_description="Get a single article by ID",
+        responses={200: ArticleDetailSerializer, 404: 'Not Found'},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def get(self, request, article_id):
         article = get_object_or_404(Article, id=article_id)
         serializer = ArticleDetailSerializer(article)
         return Response(serializer.data)
 
 class ArticleListView(APIView):
+    @swagger_auto_schema(
+        operation_description="Get paginated list of articles with filtering",
+        responses={200: ArticleListSerializer(many=True)},
+        manual_parameters=[
+            authorization_header,
+            business_id_param,
+            openapi.Parameter('status', openapi.IN_QUERY, type=openapi.TYPE_STRING),
+            openapi.Parameter('author_id', openapi.IN_QUERY, type=openapi.TYPE_STRING),
+            openapi.Parameter('category', openapi.IN_QUERY, type=openapi.TYPE_STRING),
+            openapi.Parameter('limit', openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
+            openapi.Parameter('offset', openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
+        ]
+    )
     def get(self, request):
         # Get query parameters
         status_filter = request.GET.get('status')
@@ -77,17 +98,16 @@ class ArticleListView(APIView):
         category = request.GET.get('category')
         limit = int(request.GET.get('limit', 10))
         offset = int(request.GET.get('offset', 0))
-        business_id = request.GET.get('business_id', 'default_business')
+        business_id = getattr(request.user, 'business_id', request.GET.get('business_id', 'default_business'))
         
-        # Filter articles
-        articles = Article.objects.filter(business_id=business_id)
+        filters = {
+            'status': status_filter,
+            'author_id': author_id,
+            'category': category,
+            'business_id': business_id
+        }
         
-        if status_filter:
-            articles = articles.filter(status=status_filter)
-        if author_id:
-            articles = articles.filter(author_id=author_id)
-        if category:
-            articles = articles.filter(category=category)
+        articles = ArticleService.get_articles(filters)
         
         # Pagination
         paginator = Paginator(articles, limit)
@@ -104,79 +124,70 @@ class ArticleListView(APIView):
         })
 
 class ArticleApproveView(APIView):
+    @swagger_auto_schema(
+        operation_description="Approve a student article (Staff only)",
+        request_body=approve_schema,
+        responses={200: ArticleDetailSerializer, 400: 'Bad Request', 404: 'Not Found'},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def patch(self, request, article_id):
         serializer = ArticleApproveSerializer(data=request.data)
         if serializer.is_valid():
-            article = get_object_or_404(Article, id=article_id)
+            approved_article = ArticleService.approve_article(
+                article_id,
+                serializer.validated_data['approved_by'],
+                serializer.validated_data['approved_by_name'],
+                serializer.validated_data.get('notes')
+            )
             
-            article.status = 'published'
-            article.approved_by = serializer.validated_data['approved_by']
-            article.approved_by_name = serializer.validated_data['approved_by_name']
-            article.published_at = timezone.now()
-            article.save()
+            if approved_article:
+                response_serializer = ArticleDetailSerializer(approved_article)
+                return Response(response_serializer.data)
             
-            response_serializer = ArticleDetailSerializer(article)
-            return Response(response_serializer.data)
+            return Response(
+                {'error': 'Article not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class ArticleRejectView(APIView):
+    @swagger_auto_schema(
+        operation_description="Reject a student article (Staff only)",
+        request_body=reject_schema,
+        responses={200: ArticleDetailSerializer, 400: 'Bad Request', 404: 'Not Found'},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def patch(self, request, article_id):
         serializer = ArticleRejectSerializer(data=request.data)
         if serializer.is_valid():
-            article = get_object_or_404(Article, id=article_id)
+            rejected_article = ArticleService.reject_article(
+                article_id,
+                serializer.validated_data['rejected_by'],
+                serializer.validated_data['rejected_by_name'],
+                serializer.validated_data['rejection_reason']
+            )
             
-            article.status = 'rejected'
-            article.rejected_by = serializer.validated_data['rejected_by']
-            article.rejected_by_name = serializer.validated_data['rejected_by_name']
-            article.rejection_reason = serializer.validated_data['rejection_reason']
-            article.rejected_at = timezone.now()
-            article.save()
+            if rejected_article:
+                response_serializer = ArticleDetailSerializer(rejected_article)
+                return Response(response_serializer.data)
             
-            response_serializer = ArticleDetailSerializer(article)
-            return Response(response_serializer.data)
+            return Response(
+                {'error': 'Article not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class DashboardStatsView(APIView):
+    @swagger_auto_schema(
+        operation_description="Get dashboard statistics (Staff only)",
+        responses={200: DashboardStatsSerializer},
+        manual_parameters=[authorization_header, business_id_param]
+    )
     def get(self, request):
-        business_id = request.GET.get('business_id', 'default_business')
-        today = timezone.now().date()
+        business_id = getattr(request.user, 'business_id', request.GET.get('business_id', 'default_business'))
+        stats = ArticleService.get_dashboard_stats(business_id)
         
-        # Basic counts
-        total_articles = Article.objects.filter(business_id=business_id).count()
-        pending_review = Article.objects.filter(
-            business_id=business_id, 
-            status='pending_review'
-        ).count()
-        published = Article.objects.filter(
-            business_id=business_id, 
-            status='published'
-        ).count()
-        rejected = Article.objects.filter(
-            business_id=business_id, 
-            status='rejected'
-        ).count()
-        
-        # Today's submissions
-        today_submissions = Article.objects.filter(
-            business_id=business_id,
-            submitted_at__date=today
-        ).count()
-        
-        # Recent articles for review
-        recent_articles = Article.objects.filter(
-            business_id=business_id,
-            status='pending_review'
-        ).order_by('-submitted_at')[:5]
-        
-        recent_articles_serializer = ArticleListSerializer(recent_articles, many=True)
-        
-        return Response({
-            'total_articles': total_articles,
-            'pending_review': pending_review,
-            'published': published,
-            'rejected': rejected,
-            'today_submissions': today_submissions,
-            'recent_articles': recent_articles_serializer.data
-        })
+        serializer = DashboardStatsSerializer(stats)
+        return Response(serializer.data)
